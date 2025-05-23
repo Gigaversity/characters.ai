@@ -42,7 +42,7 @@ class FullConversation(Base):
     timestamp = Column(TIMESTAMP, server_default=func.now())
 
 # Create the table if it doesn't exist
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
 
 def save_conversation(character, user_message, bot_reply):
     session = SessionLocal()
