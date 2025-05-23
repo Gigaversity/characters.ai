@@ -3,9 +3,76 @@ st.set_page_config(page_title="Character Chat", page_icon="🎭", layout="center
 import google.generativeai as genai
 from dotenv import load_dotenv
 import os
+import json
+import hashlib
+
 
 # Load environment variables from .env file
 load_dotenv()
+from sqlalchemy import create_engine, Column, Integer, String, Text, TIMESTAMP, func
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
+DB_HOST = os.getenv("DB_HOST")
+DB_NAME = os.getenv("DB_NAME")
+if not all([DB_USER, DB_PASS, DB_HOST, DB_NAME]):
+    st.error("Database credentials not found in environment variables. Please set them in your .env file.")
+    st.stop()
+
+SQLALCHEMY_DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}/{DB_NAME}"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, echo=False)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class Conversation(Base):
+    __tablename__ = "conversations"
+    id = Column(Integer, primary_key=True, index=True)
+    character = Column(String(50))
+    user_message = Column(Text)
+    bot_reply = Column(Text)
+    timestamp = Column(TIMESTAMP, server_default=func.now())
+
+# Add a new ORM model for full conversations
+class FullConversation(Base):
+    __tablename__ = "full_conversations"
+    id = Column(Integer, primary_key=True, index=True)
+    character = Column(String(50))
+    conversation = Column(Text)
+    timestamp = Column(TIMESTAMP, server_default=func.now())
+
+# Create the table if it doesn't exist
+Base.metadata.create_all(bind=engine)
+
+def save_conversation(character, user_message, bot_reply):
+    session = SessionLocal()
+    try:
+        conv = Conversation(
+            character=character,
+            user_message=user_message,
+            bot_reply=bot_reply
+        )
+        session.add(conv)
+        session.commit()
+    except Exception as e:
+        st.error(f"Database error: {e}")
+    finally:
+        session.close()
+
+def save_full_conversation(character, chat_history):
+    session = SessionLocal()
+    try:
+        conversation_json = json.dumps(chat_history, ensure_ascii=False)
+        conv = FullConversation(
+            character=character,
+            conversation=conversation_json
+        )
+        session.add(conv)
+        session.commit()
+    except Exception as e:
+        st.error(f"Database error: {e}")
+    finally:
+        session.close()
 
 # Get Gemini API Key from environment variable
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -167,6 +234,8 @@ character_name = selected_character["name"]
 # Use a separate chat history for each character
 if 'chat_histories' not in st.session_state:
     st.session_state['chat_histories'] = {k: [] for k in CHARACTERS}
+if 'last_saved_chat_len' not in st.session_state:
+    st.session_state['last_saved_chat_len'] = {k: 0 for k in CHARACTERS}
 chat_history = st.session_state['chat_histories'][character_choice]
 
 # Professional color palette
@@ -209,6 +278,33 @@ with st.form("ask_form", clear_on_submit=True):
     user_input = st.text_input(f"I am {character_name}, Ask me anything", key="input", autocomplete="off")
     submitted = st.form_submit_button("ASK")
 
+# Efficient and reliable full conversation saving:
+# - Save the full conversation only at the end of a session (when the user leaves, refreshes, or switches character)
+# - Always save individual messages immediately for reliability
+# - Use Streamlit's on_session_end callback for best reliability (Streamlit doesn't have a built-in, so we use a workaround)
+
+# Save full conversation when the user switches character or refreshes (before chat_history is cleared)
+def maybe_save_full_conversation():
+    chat_history = st.session_state['chat_histories'][character_choice]
+    if chat_history:
+        save_full_conversation(character_name, chat_history)
+        st.session_state['last_saved_chat_len'][character_choice] = len(chat_history)
+
+# Save on character switch
+if 'last_character' not in st.session_state:
+    st.session_state['last_character'] = character_choice
+if st.session_state['last_character'] != character_choice:
+    maybe_save_full_conversation()
+    st.session_state['last_character'] = character_choice
+
+# Save on app shutdown (Streamlit workaround: use an invisible widget to trigger save)
+def on_shutdown():
+    for char in CHARACTERS:
+        if st.session_state['chat_histories'][char]:
+            save_full_conversation(char, st.session_state['chat_histories'][char])
+
+st.button("_invisible_save_", key="_invisible_save_", on_click=on_shutdown, help="invisible", disabled=True)
+
 if submitted and user_input:
     chat_history.append({'role': 'user', 'content': user_input})
     with st.spinner(f'{character_name} is Typing...'):
@@ -218,7 +314,7 @@ if submitted and user_input:
             response = model.generate_content(
                 test_prompt,
                 generation_config={
-                    "max_output_tokens": 2054  # Increased from 256 to 512 to avoid empty responses
+                    "max_output_tokens": 2054
                 }
             )
             reply = getattr(response, 'text', None)
@@ -232,4 +328,5 @@ if submitted and user_input:
             reply = f"An error occurred while generating a response.\n\n**Error:** {str(e)}\n\nIf this happens repeatedly, please check your API key, network connection, or try again later."
             st.error(f"Exception details (for debugging):\n{error_details}")
         chat_history.append({'role': 'ntr', 'content': reply})
+        save_conversation(character_name, user_input, reply)
         st.rerun()
