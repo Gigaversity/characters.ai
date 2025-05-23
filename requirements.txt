@@ -3,3 +3,4 @@ google-generativeai
 dotenv
 streamlit
 sqlalchemy
+pymysql
